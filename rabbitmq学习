@@ -1,0 +1,909 @@
+---
+title: rabbitmq学习
+tags: python, rabbitmq, 消息中间件, 消息队列, 消息确认,RPC,google protocal buff
+grammar_cjkRuby: true
+---
+
+---
+
+主要参考网址：
+[csdn博客：rabbitmq从入门到精通](http://blog.csdn.net/column/details/rabbitmq.html)
+[rabbitmq 官网quick start](http://www.rabbitmq.com/getstarted.html)
+
+## 简介
+
+### rabbitmq基本架构
+
+![简单的rabbitmq工作模型][1]
+上图有3个角色：
+1.  **RabbitMQ Server**：Producer，数据的发送方。`create messages and publish (send) them to a broker server (RabbitMQ).`一个Message有两个部分：payload（有效载荷）和label（标签）。payload顾名思义就是传输的数据。label是exchange的名字或者说是一个tag，它描述了payload，而且RabbitMQ也是通过这个label来决定把这个Message发给哪个Consumer。AMQP仅仅描述了label，而RabbitMQ决定了如何使用这个label的规则。
+
+2.  **Client A & B**：RabbitMQ Server： 也叫broker server，它不是运送食物的卡车，而是一种传输服务。原话是`RabbitMQisn’t a food truck, it’s a delivery service.` 他的角色就是维护一条从Producer到Consumer的路线，保证数据能够按照指定的方式进行传输。但是这个保证也不是100%的保证，但是对于普通的应用来说这已经足够了。当然对于商业系统来说，可以再做一层数据一致性的guard，就可以彻底保证系统的一致性了。
+
+3.  **Client 1，2，3**：Consumer，数据的接收方。`Consumers attach to a broker server (RabbitMQ) and subscribe to a queue`。把queue比作是一个有名字的邮箱。当有Message到达某个邮箱后，RabbitMQ把它发送给它的某个订阅者即Consumer。当然可能会把同一个Message发送给很多的Consumer。在这个Message中，只有payload，label已经被删掉了。对于Consumer来说，它是不知道谁发送的这个信息的。就是协议本身不支持。但是当然了如果Producer发送的payload包含了Producer的信息就另当别论了。
+
+4.  数据从Producer到Consumer的正确传递，还有三个概念需要明确：exchanges, queues and bindings。
+    - **Exchanges** are where producers publish their messages.
+    - **Queuesare** where the messages end up and are received by consumers
+    - **Bindings** are how the messages get routed from the exchange to particular queues.
+    - **Connection**： 就是一个TCP的连接。Producer和Consumer都是通过TCP连接到RabbitMQ Server的。以后我们可以看到，程序的起始处就是建立这个TCP连接。
+    - **Channels**： 虚拟连接。它建立在上述的TCP连接中。数据流动都是在Channel中进行的。也就是说，一般情况是程序起始建立TCP连接，第二步就是建立这个Channel。
+
+>==说明==：为什么使用Channel，而不是直接使用TCP连接？
+>对于OS来说，建立和关闭TCP连接是有代价的，频繁的建立关闭TCP连接对于系统的性能有很大的影响，而且TCP的连接数也有限制，这也限制了系统处理高并发的能力。但是，在TCP连接中建立Channel是没有上述代价的。对于Producer或者Consumer来说，可以并发的使用多个Channel进行Publish或者Receive。有实验表明，1s的数据可以Publish10K的数据包。当然对于不同的硬件环境，不同的数据包大小这个数据肯定不一样，但是我只想说明，对于普通的Consumer或者Producer来说，这已经足够了。如果不够用，你考虑的应该是如何细化split你的设计。
+
+### rabbitmq思想阐述
+
+#### 使用ack确认Message的正确传递
+
+默认情况下，如果Message 已经被某个Consumer正确的接收到了，那么该Message就会被从queue中移除。当然也可以让同一个Message发送到很多的Consumer。
+
+如果一个queue没被任何的Consumer Subscribe（订阅），那么，如果这个queue有数据到达，那么这个数据会被cache，不会被丢弃。当有Consumer时，这个数据会被立即发送到这个Consumer，这个数据被Consumer正确收到时，这个数据就被从queue中删除。
+
+那么什么是正确收到呢？通过**ack**。每个Message都要被`acknowledged`（确认，ack）。我们可以显示的在程序中去ack，也可以自动的ack。如果有数据没有被ack，那么：RabbitMQ Server会把这个信息发送到下一个Consumer。
+如果这个app有bug，忘记了ack，那么RabbitMQ Server不会再发送数据给它，因为Server认为这个Consumer处理能力有限。
+而且ack的机制可以起到限流的作用（Benefitto throttling）：在Consumer处理完成数据后发送ack，甚至在额外的延时后发送ack，将有效的balance Consumer的load。
+
+当然对于实际的例子，比如我们可能会对某些数据进行merge，比如merge 4s内的数据，然后sleep 4s后再获取数据。特别是在监听系统的state，我们不希望所有的state实时的传递上去，而是希望有一定的延时。这样可以减少某些IO，而且终端用户也不会感觉到。
+
+
+#### Reject a message
+
+有两种方式:
++ Reject可以让RabbitMQ Server将该Message 发送到下一个Consumer。
++ 从queue中立即删除该Message。
+
+####  Creating a queue
+Consumer和Procuder都可以通过 `queue.declare` 创建queue。对于某个Channel来说，Consumer不能declare一个queue，却订阅其他的queue。当然也可以创建私有的queue。这样只有app本身才可以使用这个queue。queue也可以自动删除，被标为`auto-delete`的queue在最后一个Consumer unsubscribe后就会被自动删除。那么如果是创建一个已经存在的queue呢？那么不会有任何的影响。需要注意的是**没有任何的影响**，也就是说**第二次创建如果参数和第一次不一样，那么该操作虽然成功，但是queue的属性并不会被修改**。
+
+++那么谁应该负责创建这个queue呢？是Consumer，还是Producer？++
+
+如果queue不存在，当然Consumer不会得到任何的Message。但是如果queue不存在，那么Producer Publish的Message会被丢弃。所以，还是为了数据不丢失，Consumer和Producer都`try to create the queue！`反正不管怎么样，这个接口都不会出问题。
+queue对load balance的处理是完美的。对于多个Consumer来说，RabbitMQ 使用循环的方式（round-robin）的方式均衡的发送给不同的Consumer。
+
+
+#### Exchanges
+
+Procuder Publish的Message进入了Exchange。接着通过`routing keys`， RabbitMQ会找到应该把这个Message放到哪个queue里。queue也是通过这个`routing keys`来做的绑定。
+有三种类型的Exchanges：`direct`, `fanout`, `topic`。每个实现了不同的路由算法（routing algorithm）。 
+- `Direct exchange`: 如果 routing key 匹配, 那么Message就会被传递到相应的queue中。其实在queue创建时，它会自动的以queue的名字作为routing key来绑定那个exchange。
+- `Fanout exchange`: 会向响应的queue广播。 
+- `Topic exchange`: 对key进行模式匹配，比如ab可以传递到所有ab的queue。
+
+
+#### Virtual hosts
+每个`virtual host`本质上都是一个`RabbitMQ Server`，拥有它自己的queue，exchagne，和bings rule等等。 这保证了你可以在多个不同的application中使用RabbitMQ
+
+
+
+
+## rabbitmq “hello world”
+![rabbitmq helloworld][2]
+
+主要步骤：
+1.  启动rabbitmq server：`rabbitmq-server start`
+2.  与rabbitmq建立连接
+3.  声明queue
+4.  sender使用默认的exchage，发送消息
+5.  handler接受消息，并处理。
+
+producer(sender):
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+
+__author__ = 'hgf'
+
+# 与rabbitmq建立连接，传入的参数就是RabbitMQ Server的ip或者name
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+
+#在这个链接上建立一个channel
+channel = connection.channel()
+
+# 声明queue，创建名字为hello的queue
+channel.queue_declare("hello")
+
+# 使用默认的exchage，发送消息
+#Producer只能发送到exchange，它是不能直接发送到queue的。现在我们使用默认的exchange（名字是空字符）。这个默认的exchange允许我们发送给指定的queue
+channel.basic_publish(exchange='',
+                      routing_key="hello",
+                      body="hello world"
+                      )
+
+# 关闭channel
+channel.close()
+```
+
+consumer(handler)：
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+
+__author__ = 'hgf'
+
+# consumer处理消息的回调函数
+def callback(ch, method, properties, body):
+    print "[X] Recieved %r" % body
+
+
+# 与rabbitmq建立连接
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+
+# 声明queue，创建名字为hello的queue
+channel.queue_declare("hello")
+
+channel.basic_consume(callback,queue = "hello", no_ack=True)
+print '[*] Waiting for messages. To exit press Ctrl+C'
+
+channel.start_consuming()
+```
+
+>==说明==：
+回调函数的四个参数：
+ch：[channel] <pika.adapters.blocking_connection.BlockingChannel object at 0x287d0d0>
+method：[Deliver] <Basic.Deliver(['consumer_tag=ctag1.307f92b29cc44a6c882e39a40b5a1558', 'delivery_tag=1', 'exchange=', 'redelivered=False', 'routing_key=hello'])>
+properties：[属性] <BasicProperties> 
+body：[发送的内容] 'hello world'
+
+
+
+## 任务分发机制
+
+### 场景和实验程序
+
+当有Consumer需要大量的运算时，RabbitMQ Server需要一定的分发机制来balance每个Consumer的load。试想一下，对于web application来说，在一个很多的HTTP request里是没有时间来处理复杂的运算的，只能通过后台的一些工作线程来完成。接下来我们分布讲解。 
+
+应用场景就是 RabbitMQ Server会将queue的Message分发给不同的Consumer以处理计算密集型的任务：
+![任务分发机制][3]
+即：一个很复杂的工作使用多个consumer共同完成计算。
+
+为了是Consumer做的是计算密集型的工作，那就不能简单的字符串了。在现实应用中，Consumer有可能做的是一个图片的resize，或者是pdf文件的渲染或者内容提取。但是作为Demo，还是用字符串模拟吧：通过**字符串中的.的数量来决定计算的复杂度，每个.都会消耗1s，即sleep(1)**。
+
+producer：
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+import sys
+
+__author__ = 'hgf'
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+channel.queue_declare("hello")
+
+message = " ".join(sys.argv[1:]) or "hello world"
+channel.basic_publish(exchange='',
+                      routing_key="hello",
+                      body=message
+                      )
+channel.close()
+```
+
+
+consumer：
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+import time
+
+__author__ = 'hgf'
+
+def callback(ch, method, properties, body):
+    print "[X] Recieved %r" % body
+    time.sleep(body.count('.'))
+    print "[X] Done"
+
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+channel.queue_declare("hello")
+
+channel.basic_consume(callback,queue = "hello", no_ack=True)
+print '[*] Waiting for messages. To exit press Ctrl+C'
+
+channel.start_consuming()
+```
+
+>==说明==:回掉函数为什么加上一句`time.sleep(body.count('.'))`
+字符串中的.号的数量来决定计算的复杂度，每个.号都会消耗1s，即sleep(1)
+当producer 一次发送含有一个点.,两个点..，三个点...,的消息时，接收到他们的consumer会分别sleep 1s, 2s, 3s。sleep的时间长度代表consumer做计算所花费的时间长度。
+
+
+### Round-robin dispatching 循环分发
+RabbitMQ的分发机制非常适合扩展，而且它是专门为并发程序设计的。如果现在load加重，那么只需要创建更多的Consumer来进行任务处理即可。对于负载还要加大怎么办？可以创建多个virtual Host，细化不同的通信类别了。
+
+利用前小结准备的代码实验：
+1.  先启动两个 consumer
+2.  不停地运行 producer，并且在producer的参数入口带上不同数量的点号.。例如：
+
+```powershell?linenums
+python producer.py First message.
+python producer.py Second message..
+python producer.py Third message...
+python producer.py Fourth message....
+python producer.py Fifth message.....
+```
+3.  分别查看两个consumer的输出：
+
+consumer1的输出：
+```powershell?linenums
+[*] Waiting for messages. To exit press CTRL+C
+[x] Received 'First message.'
+[x] Received 'Third message...'
+[x] Received 'Fifth message.....'
+```
+consumer2的输出：
+```powershell?linenums
+[*] Waiting for messages. To exit press CTRL+C
+[x] Received 'First message.'
+[x] Received 'Third message...'
+[x] Received 'Fifth message.....'
+```
+默认情况下，RabbitMQ 会顺序的分发每个Message。当每个收到ack后，会将该Message删除，然后将下一个Message分发到下一个Consumer。这种分发方式叫做round-robin。
+
+
+### Message acknowledgment 消息确认
+每个Consumer可能需要一段时间才能处理完收到的数据。如果在这个过程中，Consumer出错了，异常退出了，而数据还没有处理完成，那么非常不幸，这段数据就丢失了。因为我们采用`no-ack`的方式进行确认，也就是说，每次Consumer接到数据后，而不管是否处理完成，RabbitMQ Server会立即把这个Message标记为完成，然后从queue中删除了。
+
+如果一个Consumer异常退出了，它处理的数据能够被另外的Consumer处理，这样数据在这种情况下就不会丢失了（注意是这种情况下）。
+
+为了保证数据不被丢失，RabbitMQ支持消息确认机制，即`acknowledgments`。为了保证数据能被正确处理而不仅仅是被Consumer收到，那么我们不能采用no-ack。而应该是在处理完数据后发送ack。
+
+在处理数据后发送的ack，就是告诉RabbitMQ数据已经被接收，处理完成，RabbitMQ可以去安全的删除它了。 
+
+如果Consumer退出了但是没有发送ack，那么RabbitMQ就会把这个Message发送到下一个Consumer。这样就保证了在Consumer异常退出的情况下数据也不会丢失。
+
+这里并没有用到超时机制。RabbitMQ仅仅通过Consumer的连接中断来确认该Message并没有被正确处理。也就是说，RabbitMQ给了Consumer足够长的时间来做数据处理。
+
+**默认情况下，消息确认是打开的（enabled）**。在实验程序consumer中，我们通过`no_ack = True`(`channel.basic_consume(callback,queue = "hello", no_ack=True)`) 关闭了ack。重新修改一下callback，以在消息处理完成后发送ack：
+```python?linenums
+def callback(ch, method, properties, body):
+    print " [x] Received %r" % (body,)
+    time.sleep( body.count('.') )
+    print " [x] Done"
+    ch.basic_ack(delivery_tag = method.delivery_tag)
+
+channel.basic_consume(callback,
+                      queue='hello')
+```
+
+这样即使你使用Ctr-C关闭了consumer程序，那么Message也不会丢失了，它会被分发到下一个Consumer。 
+
+
+如果忘记了ack，那么后果很严重。当Consumer退出时，Message会重新分发。然后RabbitMQ会占用越来越多的内存，由于RabbitMQ会长时间运行，因此这个“内存泄漏”是致命的。去调试这种错误，可以通过一下命令打印un-acked Messages：
+```powershell?linenums
+$ sudo rabbitmqctl list_queues name messages_ready messages_unacknowledged  
+Listing queues ...  
+hello    0       0  
+...done.  
+
+```
+
+**==验证实验==**：
+*验证内容*：验证rabbitmq server没有收到ack之前，message是不会丢失的。
+*验证方案*：将callbak函数的`ch.basic_ack(delivery_tag = method.delivery_tag)`删除，不给rabbitmq server回复ack响应，rabbitmq server 就不知道consumer是否处理了message，当有下一个consumer来，但是上一个consumer没有
+在规定的时间，或者没有ack前就断开了与rabbitmq server的连接（rabbitmq server 会认为上一个consumer处理不了这个message），rabbitmq server会把同样的message传给这个consumer。
+
+
+
+
+### Message durability消息持久化
+上一节中我们知道了即使Consumer异常退出，Message也不会丢失。但是如果RabbitMQ Server退出呢？软件都有bug，即使RabbitMQ Server是完美毫无bug的（当然这是不可能的，是软件就有bug，没有bug的那不叫软件），它还是有可能退出的：被其它软件影响，或者系统重启了，系统panic了。。。
+为了保证在RabbitMQ退出或者crash了数据仍没有丢失，需要将queue和Message都要持久化。
+**queue的持久化需要在声明时指定`durable=True`**：
+`channel.queue_declare(queue='hello', durable=True)`
+
+上述语句执行不会有什么错误，但是确得不到我们想要的结果，原因就是RabbitMQ Server已经维护了一个叫hello的queue，那么上述执行不会有任何的作用，也就是hello的任何属性都不会被影响。
+声明一个另外的名字的queue，比如名字定位task_queue：
+`channel.queue_declare(queue='task_queue', durable=True)`
+Producer和Consumer都应该去创建这个queue，尽管只有一个地方的创建是真正起作用的。
+
+需要**持久化Message**，即在Publish的时候指定一个properties，方式如下：
+```python?linenums
+channel.basic_publish(exchange='',
+                      routing_key="task_queue",
+                      body=message,
+                      properties=pika.BasicProperties(
+                      delivery_mode = 2, # make message persistent
+                      ))
+```
+>==持久化的进一步讨论==
+为了数据不丢失，我们采用了：
+>1. 在数据处理结束后发送ack，这样RabbitMQ Server会认为Message Deliver 成功。
+>2. 持久化queue，可以防止RabbitMQ Server 重启或者crash引起的数据丢失。
+>3. 持久化Message，理由同上。
+>
+>但是这样能保证数据100%不丢失吗？
+>不是。问题就在于**RabbitMQ需要时间去把这些信息存到磁盘上**，这个time window虽然短，但是它的确还是有。在这个时间窗口内如果数据没有保存，数据还会丢失。还有另一个原因就是RabbitMQ并不是为每个Message都做fsync：它可能仅仅是把它保存到Cache里，还没来得及保存到物理磁盘上。
+>
+>因此这个持久化还是有问题。但是对于大多数应用来说，这已经足够了。当然**为了保持一致性，你可以把每次的publish放到一个transaction中**。这个transaction的实现需要user defined codes。
+那么商业系统会做什么呢？一种可能的方案是在系统panic时或者异常重启时或者断电时，应该给各个应用留出时间去flash cache，保证每个应用都能exit gracefully。
+
+
+**==验证实验==**：
+*验证内容*：验证queue的持久化。
+*验证方案*：在声明queue时，设置`durable = True`，即：`channel.declare_queue("hello", durable = True)`。并且在producer在publish消息的时候，指定一个properties，方式如下：
+```python?linenums
+channel.basic_publish(exchange='',
+                      routing_key="task_queue",
+                      body=message,
+                      properties=pika.BasicProperties(
+                      delivery_mode = 2, # make message persistent
+                      ))
+```
+producer往rabbitmq server上发送数据，然后kill rabbitmq server的进程；然后启动 rabbitmq server ，启动consumer，consumer可以正常获取rabbitmq被kill前producer传入的数据。
+
+
+
+
+### Fair dispatch 公平分发
+你可能也注意到了，分发机制不是那么优雅。默认状态下，RabbitMQ将第n个Message分发给第n个Consumer。当然n是取余后的。它不管Consumer是否还有unacked Message，只是按照这个默认机制进行分发。
+
+那么如果有个Consumer工作比较重，那么就会导致有的Consumer基本没事可做，有的Consumer却是毫无休息的机会。那么，RabbitMQ是如何处理这种问题呢？
+
+![公平分发][4]
+
+通过 basic.qos 方法设置prefetch_count=1 。这样RabbitMQ就会使得每个Consumer在同一个时间点最多处理一个Message。换句话说，在接收到该Consumer的ack前，他它不会将新的Message分发给它。 设置方法如下：
+`channel.basic_qos(prefetch_count=1)`
+
+
+>==注意==：这种方法可能会导致queue满。当然，这种情况下你可能需要添加更多的Consumer，或者创建更多的virtualHost来细化你的设计。
+
+
+## 分发到多Consumer（Publish/Subscribe）
+
+上节中，我们把每个Message都是deliver到某个Consumer。在本节中，我们将会将同一个Message deliver到多个Consumer中。这个模式也被成为 **"publish / subscribe"**。
+
+本节中，创建一个日志系统，它包含两个部分：第一个部分是发出log（Producer），第二个部分接收到并打印（Consumer）。 我们将构建两个Consumer，第一个将log写到物理磁盘上；第二个将log输出的屏幕。
+
+
+### Exchanges
+
+RabbitMQ 的Messaging  Model就是Producer并不会直接发送Message到queue。实际上，**Producer并不知道它发送的Message是否已经到达queue**。
+
+Producer发送的Message实际上是发到了**Exchange**中。它的功能也很简单：从Producer接收Message，然后投递到queue中。++Exchange需要知道如何处理Message，是把它放到那个queue中，还是放到多个queue中++？这个rule是通过Exchange 的类型定义的。
+![含有Exchange的rabbitmq模型][5]
+
+我们知道有三种类型的Exchange：direct, topic 和fanout。
+fanout就是广播模式，会将所有的Message都放到它所知道的queue中。创建一个名字为logs，类型为fanout的Exchange：
+`channel.exchange_declare(exchange='logs', type='fanout')`
+
+现在我们可以通过exchange，而不是routing_key来publish Message了：
+```python?linenums
+channel.basic_publish(exchange='logs',
+                      routing_key='',
+                      body=message)
+```
+
+>==rabbitmq list exchange 命令==：
+>`sudo rabbitmqctl list_exchanges`
+>在列出的exchange中，`amq.* exchanges`（amq.* 表示exchange name 的通用形式，例如amq.direct，amq.topic） 和`the default (unnamed)exchange`是RabbitMQ默认创建的。
+
+
+### Temporary queues
+
+截至现在，我们用的queue都是有名字的：第一个是hello，第二个是task_queue。*使用有名字的queue，使得在Producer和Consumer之前共享queue成为可能*。
+但是对于我们将要构建的日志系统，并不需要有名字的queue。我们希望得到所有的log，而不是它们中间的一部分。而且我们只对当前的log感兴趣。为了实现这个目标，我们需要两件事情：
+1.  每当Consumer连接时，我们需要一个新的，空的queue。因为我们不对老的log感兴趣。幸运的是，**如果在声明queue时不指定名字，那么RabbitMQ会随机为我们选择这个名字**。方法：`result = channel.queue_declare()`，获取result所代表的queue的名字的方法：`result.method.queue`
+2.  当Consumer关闭连接时，这个queue要被deleted。可以加个exclusive的参数。`result = channel.queue_declare(exclusive=True)`
+
+>==注意==：
+>1. publish到一个不存在的exchange是被禁止的。
+
+>==channel.queue_declare()参数意思==：
+> - queue:      str或unicode；queue的名字，如果为空，会自动创建
+> - passive：   bool；检查queue是否存在。
+> - durable：   bool；是否持久化，在中断后然可继续
+> - exclusive： bool；只允许被当前连接中的这个connection连接到这个queue
+> - auto_delete:bool；在consumer断开连接后删除queue
+> - arguments: dict；用户自定义的键值对参数
+
+
+### Bindings绑定
+
+现在我们已经创建了fanout类型的exchange和没有名字的queue（实际上是RabbitMQ帮我们取了名字）。那exchange怎么样知道它的Message发送到哪个queue呢？通过bindings：绑定。
+![exchange和queue绑定][6]
+`channel.queue_bind(exchange='logs',queue=result.method.queue)`
+
+>==注意==：
+>1. **publish到一个不存在的exchange是被禁止的**。
+>2. 如果没有**queue bindings exchange**的话，log是被丢弃的。
+
+>==rabbitmq 查看已经有的绑定==：
+>`sudo rabbitmqctl list_bindings`
+
+### 最终版本
+
+我们最终实现的数据流图如下：
+![最终数据流图][7]
+Producer，在这里就是产生log的program，基本上和前几个都差不多。最主要的区别就是publish通过了exchange而不是routing_key。
+
+程序源码：
+
+producer:
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+import sys
+
+__author__ = 'hgf'
+
+con = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = con.channel()
+channel.queue_declare()
+exchange = channel.exchange_declare(exchange="log",exchange_type="fanout")
+
+message = ' '.join(sys.argv[1:]) or "hello world"
+
+channel.publish(exchange="log",routing_key='', body = message)
+print(" [x] sent: %r") % message
+```
+
+
+consumer.py:print to screen
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+
+__author__ = 'hgf'
+
+def callbak(ch,method, properties, body):
+    print "[x] recieved:%r" %body
+
+con = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = con.channel()
+result = channel.queue_declare(exclusive=True)
+
+exchange = channel.exchange_declare(exchange="log",exchange_type="fanout")
+
+channel.queue_bind(result.method.queue,'log')
+channel.basic_consume(callbak,result.method.queue,no_ack=True)
+channel.start_consuming()
+```
+
+## Routing 消息路由
+
+### Bindings绑定
+绑定其实就是关联了exchange和queue。或者这么说：*queue对exchagne的内容感兴趣，exchange要把它的Message deliver到queue中*。
+实际上，绑定可以带`routing_key`这个参数。其实这个参数的名称和`basic_publish` 的参数名是相同了。为了避免混淆，我们把它成为`binding key`。
+例子：使用一个key来创建binding 
+```python?linenums
+channel.queue_bind(exchange=exchange_name,
+                   queue=queue_name,
+                   routing_key='black')
+```
+对于++fanout的exchange来说，这个参数是被忽略的++。
+
+
+### Direct exchange
+Direct exchange的路由算法非常简单：通过binding key的完全匹配，可以通过下图来说明。
+![direct exchange][8]
+ exchange X和两个queue绑定在一起。Q1的binding key是orange。Q2的binding key是black和green。
+当publish key是orange时，exchange会把它放到Q1。如果是black或者green那么就会到Q2。其余的Message都会被丢弃。
+
+### Multiple bindings
+多个queue绑定同一个key是可以的。对于下图的例子，Q1和Q2都绑定了black。也就是说，对于routing key是black的Message，会被deliver到Q1和Q2。其余的Message都会被丢弃。
+
+![Multi bingdings][9]
+
+
+
+### 日志系统最终版本
+
+producer_log.py:
+```python?linenums
+#! /usr/bin/python
+#coding:utf-8
+
+import pika
+import sys
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+
+message = "".join(sys.argv[1:]) or "hello world"
+ex = channel.exchange_declare(exchange="log_direct",exchange_type="direct")
+channel.basic_publish(exchange="log_direct",routing_key=sys.argv[1],body=message)
+connection.close()
+```
+
+consumer_log.py
+```python?linenums
+#!/usr/bin/python
+#coding:utf-8
+
+import pika
+import sys
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+channel.exchange_declare(exchange="log_direct", exchange_type="direct")
+
+result =  channel.queue_declare(exclusive=True)
+queue_name = result.method.queue
+
+serverities = sys.argv[1:]
+if not serverities:
+    print "Usage: %s [info] [warnning] [error]" %sys.argv[0]
+    sys.exit(1)
+for serverity in serverities:
+    channel.queue_bind(exchange="log_direct",queue=queue_name,routing_key=serverity)
+
+def callbak(ch, method, properties, body):
+    print "[X]: %r %r" %(method.routing_key, body)
+
+channel.basic_consume(callbak,queue=queue_name, no_ack=True)
+channel.start_consuming()
+```
+
+运行时，使用`python produce_log.py info`创建一个info queue，然后将`exchange=log_direct` 与它绑定；使用`python produce_log.py error`创建一个 error queue，并与`exchange=log_direct`绑定。
+
+使用consumer消费产生的消息。使用`python consumer_log.py info > info.log`将info的消息保存到文件，使用`python consumer_log.py error`,将消息打印到屏幕。
+
+## 使用主题进行消息分发
+
+上节我们实现了一个简单的日志系统。Consumer可以监听不同severity的log。但是，这也是它之所以叫做简单日志系统的原因，因为是*仅仅*能够通过severity设定。不支持更多的标准。
+比如syslog unix的日志工具，它可以通过severity (info/warn/crit...) 和模块(auth/cron/kern...)。这可能更是我们想要的：我们可以仅仅需要cron模块的log。
+为了实现类似的功能，我们需要用到topic exchange。
+
+### Topic exchange
+对于Message的`routing_key`是有限制的，不能使任意的。格式是以点号“."分割的字符表。比如："stock.usd.nyse", "nyse.vmw", "quick.orange.rabbit"。你可以放任意的key在routing_key中，当然**最长不能超过255 bytes**。
+
+>==routing_key特殊字符==（在正则表达式里叫元字符）：
+>- * (星号) 代表任意 一个**单词**,不是字符。例如：routing_key="cron.*"，那么"cron.ass"匹配，而"cron.ass.xxx"就不匹配了，因为ass可视为一个单词，而ass.xxx中间带了`.`，就表示两个单词了。
+>- \#    (hash) 0个或者多个**单词**,不是字符。例如：routing_key="cron.#"，那么"cron.ass"，"cron","cron.aaa.bbb.ccc"匹配，因为#可以匹配0个单词或多个单词，每个单词前面多一个`.`作为分割。
+
+>==说明==：
+在rabbitmq中`.`为单词的分界符号。
+
+
+![主题消息例子][10]
+ Producer发送消息时需要设置`routing_key`，`routing_key`包含三个单词和两个点号。第一个key是描述了celerity（灵巧，敏捷），第二个是colour（色彩），第三个是species（物种）："<celerity>.<colour>.<species>"。
+ 
+在这里我们创建了两个绑定： Q1 的binding key 是"\*.orange.\*"； Q2 是  "\*.\*.rabbit" 和 "lazy.#"：
+- Q1 感兴趣所有orange颜色的动物
+- Q2 感兴趣所有的rabbits和所有的lazy
+
+比如routing\_key是 "quick.orange.rabbit"将会发送到Q1和Q2中。消息"lazy.orange.elephant" 也会发送到Q1和Q2。但是"quick.orange.fox" 会发送到Q1；"lazy.brown.fox"会发送到Q2。"lazy.pink.rabbit" 也会发送到Q2，但是尽管两个routing\_key都匹配，它也只是发送一次。"quick.brown.fox" 会被丢弃。
+
+如果发送的单词不是3个呢？ 要看情况，因为#是可以匹配0个或任意个单词。比如"orange" or "quick.orange.male.rabbit"，它们会被丢弃。如果是lazy那么就会进入Q2。类似的还有 "lazy.orange.male.rabbit"，尽管它包含四个单词。
+
+由于有"*" (star) and "#" (hash)， Topic exchange 非常强大并且可以转化为其他的exchange：
+
+如果`binding_key` 是 "#"  它会接收所有的Message，不管routing_key是什么，就像是`fanout exchange`。
+
+如果 "*" (star) and "#" (hash) 没有被使用，那么`topic exchange`就变成了`direct exchange`。
+
+### 重新定义日志系统
+
+现在我们要refine我们上篇的日志系统。routing keys 有两个部分: "<facility>.<severity>"。
+
+producer.py
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+import sys
+
+__author__ = 'hgf'
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+channel.exchange_declare(exchange="topic_log", exchange_type="topic")
+
+message = "".join(sys.argv[2:]) or "hello world"
+
+channel.basic_publish(exchange="topic_log",routing_key=sys.argv[1],body=message)
+channel.close()
+connection.close()
+```
+
+运行时类似之前定义过的"<facility>.<severity>"，例如：`python producer.py "cron.*"`
+
+consumer.py
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+from netaddr.ip.iana import query
+import pika
+import sys
+from scss.extension.core import change_color
+
+__author__ = 'hgf'
+
+
+def callbak(ch, method, properties,body):
+    print "[X] %r %r" % (method.routing_key, body)
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+channel.exchange_declare(exchange="topic_log", exchange_type="topic")
+result = channel.queue_declare()
+queue_name = result.method.queue
+
+serverities =sys.argv[1:]
+if not serverities:
+    print("Usage: %s [info] [warnning] [error]" % sys.argv[0])
+
+for serverity in serverities:
+    channel.queue_bind(queue_name,"topic_log",routing_key=serverity)
+
+channel.basic_consume(callbak,queue_name,no_ack=True)
+channel.start_consuming()
+```
+运行时类似之前定义过的"<facility>.<severity>"，可联系定义多个routing_key类型，例如：`python producer.py "cron.*" "kern.#"`
+
+
+
+## 适用于云计算集群的远程调用(RPC)
+
+在云计算环境中，很多时候需要用它其他机器的计算资源，我们有可能会在接收到Message进行处理时，会把一部分计算任务分配到其他节点来完成。那么，RabbitMQ如何使用RPC呢？在本节中，我们将会通过其它节点求来斐波纳契完成示例。
+
+### 客户端接口 Client interface
+
+为了展示一个RPC服务是如何使用的，我们将创建一段很简单的客户端class。 它将会向外提供名字为call的函数，这个call会发送RPC请求并且阻塞知道收到RPC运算的结果。代码如下：
+```python?linenums
+fibonacci_rpc = FibonacciRpcClient()  
+result = fibonacci_rpc.call(4)  
+print "fib(4) is %r" % (result,) 
+```
+
+### 回调函数队列 Callback queue
+总体来说，在RabbitMQ进行RPC远程调用是比较容易的。client发送请求的Message然后server返回响应结果。为了收到响应client在publish message时需要提供一个`callback`（回调）的queue地址。code如下:
+```python?linenums
+result = channel.queue_declare(exclusive=True)  
+callback_queue = result.method.queue  
+  
+channel.basic_publish(exchange='',  
+                      routing_key='rpc_queue',  
+                      properties=pika.BasicProperties(  
+                            reply_to = callback_queue,  
+                            ),  
+                      body=request)  
+  
+# ... and some code to read a response message from the callback_queue ... 
+```
+
+>==message properties==:
+>AMQP 预定义了14个属性。它们中的绝大多很少会用到。以下几个是平时用的比较多的：
+>- `delivery_mode`: 持久化一个Message（通过设定值为2）。其他任意值都是非持久化。
+>- `content_type`: 描述`mime-type` 的encoding。比如设置为JSON编码：设置该property为`application/json`。
+>- `reply_to`: 一般用来指明用于回调的queue（Commonly used to name a callback queue）。
+>- `correlation_id`: 在请求中关联处理RPC响应（correlate RPC responses with requests）。
+
+
+### 相关id Correlation id
+
+在上个小节里，实现方法是对每个RPC请求都会创建一个`callback queue`。这是**不高效**的。幸运的是，在这里有一个解决方法：为每个client创建唯一的callback queue。【**对每个RPC请求创建queue不高效，对每个client创建一个queue比较好**】
+
+
+这又有其他问题了：收到响应后它无法确定是否是它的，因为所有的响应都写到同一个queue了。上一小节的correlation_id在这种情况下就派上用场了：**对于每个request，都设置唯一的一个值，在收到响应后，通过这个值就可以判断是否是自己的响应**。如果不是自己的响应，就不去处理。
+
+
+### 远程调用过程小结
+![远程调用过程小结][11]
+
+工作流程：
+- 当客户端启动时，它创建了匿名的exclusive callback queue.
+- 客户端的RPC请求时将同时设置两个properties： `reply_to`设置为callback queue；`correlation_id`设置为每个request一个独一无二的值.
+- 请求将被发送到an rpc_queue queue.
+- RPC端或者说server一直在等待那个queue的请求。当请求到达时，它将通过在reply_to指定的queue回复一个message给client。
+- client一直等待callback queue的数据。当message到达时，它将检查correlation_id的值，如果值和它request发送时的一致那么就将返回响应。
+
+
+### 远程调用实现
+
+client.py
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+import uuid
+
+__author__ = 'hgf'
+
+class Fibona(object):
+    def __init__(self):
+        self.response=None
+        self.cor_id = str(uuid.uuid4())
+
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+        self.channel = self.connection.channel()
+        result = self.channel.queue_declare()
+        self.callbak_queue = result.method.queue
+        self.channel.basic_consume(self.on_response, queue=self.callbak_queue, no_ack=True)
+
+    def on_response(self, ch, method, proper, body):
+        if self.cor_id == proper.correlation_id:
+            self.response = body
+
+
+    def call(self,n):
+        self.channel.basic_publish(
+            exchange='',
+            routing_key='rpc',
+            properties=pika.BasicProperties(
+                reply_to = self.callbak_queue,
+                correlation_id=self.cor_id
+            ),
+            body=str(n)
+        )
+
+        while self.response is None:
+            self.connection.process_data_events()
+        return int(self.response)
+
+fibo_rpc = Fibona()
+
+print "[X] Requesting fib(30)"
+response = fibo_rpc.call(30)
+print "[.] answer %r" % response
+```
+客户端实现步骤：
+1.  连接rabbitmq server
+2.  监听结果queue，此时相当于server发送消息的消费者。先验证消息是不是本次任务的返回结果，然后获取结果。
+3.  实现请求函数`call`，向server端发送消息，相当于消息的生产者，将生产的消息发送给rpc queue。
+
+server.py
+```python?linenums
+#! /usr/bin/python
+# coding:utf-8
+import pika
+import sys
+
+__author__ = 'hgf'
+
+
+def fi(n):
+    if n==0:
+        return 0
+    elif n==1:
+        return 1
+    else:
+        return fi(n-1) + fi(n-2)
+
+def on_request(ch, method, proper,body):
+    n = int(body)
+
+    print "[.] fi(%d)" % n
+
+    response = fi(n)
+    ch.basic_publish(exchange="",
+                     routing_key=proper.
+                     reply_to,
+                     properties=pika.BasicProperties(correlation_id=proper.correlation_id),
+                     body=str(response)
+                     )
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+channel = connection.channel()
+
+channel.queue_declare(queue = "rpc")
+
+channel.basic_qos(prefetch_count=1)
+channel.basic_consume(on_request,"rpc")
+
+print "[X] Waiting RPC requests"
+
+channel.start_consuming()
+```
+服务端实现步骤：
+1.  连接rabbitmq
+2.  实现斐波那契函数
+3.  消费client发送的message，即获取n并且计算它的斐波那契值
+4.  根据client对返回消息的要求，将计算返回到特定的queue，并设置对应的correlation_id，此时相当于消息的生产者。
+
+
+
+## ProtoBuf（Google Protocol Buffer）
+
+### 什么是ProtoBuf
+一种轻便高效的结构化数据存储格式，可以**用于结构化数据串行化，或者说序列化**。它很适合做**数据存储**或 **RPC 数据交换格式**。可用于通讯协议、数据存储等领域的语言无关、平台无关、可扩展的序列化结构数据格式。目前提供了 `C++`、`Java`、`Python` 三种语言的 API。
+
+它可以作为RabbitMQ的Message的数据格式进行传输，由于是结构化的数据，这样就极大的方便了Consumer的数据高效处理。当然了你可能说使用XML不也可以吗？与XML相比，ProtoBuf有以下优势：
+- 简单
+- size小了3-10倍
+- 速度快乐20-100倍
+- 易于编程
+- 减小了语义的歧义
+
+### 使用例子
+待学习后添加上！
+
+## Publisher的消息确认机制
+
+queue和consumer之间的消息确认机制：通过设置ack。那么Publisher能不到知道他post的Message有没有到达queue，甚至更近一步，是否被某个Consumer处理呢？毕竟对于一些非常重要的数据，可能Publisher需要确认某个消息已经被正确处理。
+
+ 在我们的系统中，我们没有实现这种确认，也就是说，不管Message是否被Consume了，Publisher不会去care。它只是将自己的状态publish给上层，由上层的逻辑去处理。如果Message没有被正确处理，可能会导致某些状态丢失。但是由于提供了其他强制刷新全部状态的机制，因此这种异常情况的影响也就可以忽略不计了。
+
+对于某些异步操作，比如客户端需要创建一个FileSystem，这个可能需要比较长的时间，甚至要数秒钟。这时候通过RPC可以解决这个问题。因此也就不存在Publisher端的确认机制了。
+
+
+### 事务机制 VS Publisher Confirm
+
+ 如果采用标准的 AMQP 协议，则唯一能够保证消息不会丢失的方式是利用**事务机制** -- 令 channel 处于 `transactional 模式`、向其 publish 消息、执行 commit 动作。在这种方式下，事务机制会带来大量的多余开销，并会导致吞吐量下降 250% 。为了补救事务带来的问题，引入了 `confirmation 机制`（即 Publisher Confirm）。
+
+ 为了使能 confirm 机制，client 首先要发送 confirm.select 方法帧。
+ 取决于是否设置了 no-wait 属性，broker 会相应的判定是否以 confirm.select-ok 进行应答。一旦在 channel 上使用 confirm.select方法，channel 就将处于 confirm 模式。处于 transactional 模式的 channel 不能再被设置成 confirm 模式，反之亦然。
+
+一旦 channel 处于 confirm 模式，broker 和 client 都将启动消息计数（以 confirm.select 为基础从 1 开始计数）。broker 会在处理完消息后，在当前 channel 上通过发送 basic.ack 的方式对其进行 confirm 。 `delivery-tag` 域的值标识了被 confirm 消息的**序列号**。broker 也可以通过设置 basic.ack 中的 `multiple` 域来表明**到指定序列号为止的所有消息都已被 broker 正确的处理**了。
+
+在异常情况中，broker 将无法成功处理相应的消息，此时 broker 将发送 basic.nack 来代替 basic.ack 。在这个情形下，basic.nack 中各域值的含义与 basic.ack 中相应各域含义是相同的，同时 requeue 域的值应该被忽略。通过 nack 一或多条消息，broker 表明自身无法对相应消息完成处理，并拒绝为这些消息的处理负责。在这种情况下，client 可以选择将消息 re-publish 。
+
+ 在 channel 被设置成 confirm 模式之后，所有被 publish 的后续消息都将被 confirm（即 ack） 或者被 nack **一次**。但是++没有对消息被 confirm 的快慢做任何保证++，并且同一条消息不会既被 confirm 又被 nack 。
+
+### 消息在什么时候确认
+
+broker 将在下面的情况中对消息进行 confirm：
+- broker 发现当前消息无法被路由到指定的 queues 中（如果设置了 mandatory 属性，则 broker 会先发送 basic.return）
+- 非持久属性的消息到达了其所应该到达的所有 queue 中（和镜像 queue 中）
+- 持久消息到达了其所应该到达的所有 queue 中（和镜像 queue 中），并被持久化到了磁盘（被 fsync）
+- 持久消息从其所在的所有 queue 中被 consume 了（如果必要则会被 acknowledge）
+
+
+broker 会丢失持久化消息，如果 broker 在将上述消息写入磁盘前异常。在一定条件下，这种情况会导致 broker 以一种奇怪的方式运行。例如，考虑下述情景：
+1.  一个 client 将持久消息 publish 到持久 queue 中
+2.  另一个 client 从 queue 中 consume 消息（注意：该消息具有持久属性，并且 queue 是持久化的），当尚未对其进行 ack
+3.  broker 异常重启
+4.  client 重连并开始 consume 消息
+
+在上述情景下，client 有理由认为消息需要被（broker）重新 deliver 。但这并非事实：重启（有可能）会令 broker 丢失消息。为了确保持久性，client 应该使用 confirm 机制。如果 publisher 使用的 channel 被设置为 confirm 模式，publisher 将不会收到已丢失消息的 ack（这是因为 consumer 没有对消息进行 ack ，同时该消息也未被写入磁盘）。
+
+
+### mandatory和immediate标志位
+
+首先要区别AMQP协议mandatory和immediate标志位的作用。
+
+mandatory和immediate是AMQP协议中basic.pulish方法中的两个标志位，它们都有当消息传递过程中不可达目的地时将消息返回给生产者的功能。具体区别在于：
+1. mandatory标志位
+当mandatory标志位设置为true时，如果exchange根据自身类型和消息routeKey无法找到一个符合条件的queue，那么会调用basic.return方法将消息返还给生产者；当mandatory设为false时，出现上述情形broker会直接将消息扔掉。
+2. immediate标志位
+当immediate标志位设置为true时，如果exchange在将消息route到queue(s)时发现对应的queue上没有消费者，那么这条消息不会放入队列中。当与消息routeKey关联的所有queue(一个或多个)都没有消费者时，该消息会通过basic.return方法返还给生产者。
+
+
+
+## 展望
+
+在此我们已经学完了基本的rabbitmq的思想，下一步可以学习学习rabbitmq服务端的扩展，优化和管理方面的知识。
+
+
+
+## 可以学习书目
+
+- 《rabbitmq in action》
+
+
+
+
+
+
+
+
+
+
+
+---
+**{贺广福}(heguangfu)**(tm) @2015-9-27
+:laughing:
+
+
+  [1]: ./images/1443597717418.jpg "1443597717418.jpg"
+  [2]: ./images/1443600023494.jpg "1443600023494.jpg"
+  [3]: ./images/1443600574030.jpg "1443600574030.jpg"
+  [4]: ./images/1443859020463.jpg "1443859020463.jpg"
+  [5]: ./images/1443859542919.jpg "1443859542919.jpg"
+  [6]: ./images/1443861029907.jpg "1443861029907.jpg"
+  [7]: ./images/1443861188115.jpg "1443861188115.jpg"
+  [8]: ./images/1443871097772.jpg "1443871097772.jpg"
+  [9]: ./images/1443871218610.jpg "1443871218610.jpg"
+  [10]: ./images/1444095364382.jpg "1444095364382.jpg"
+  [11]: ./images/1444100808002.jpg "1444100808002.jpg"
